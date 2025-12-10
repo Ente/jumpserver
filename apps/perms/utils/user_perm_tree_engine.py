@@ -1,16 +1,19 @@
-from django.db.models import F
+import re
 from typing import Optional
 from collections import defaultdict
+
+from django.db.models import F
 
 from users.models import User
 from assets.models import Asset, Node
 from perms.models import AssetPermission
-
 from common.utils import lazyproperty
 from orgs.utils import current_org
 
 
 class TreeNode:
+
+    separator = ':'
 
     class Type:
         BRIDGE = 'bridge'
@@ -37,6 +40,14 @@ class TreeNode:
 
     def assets_amount_increment(self, amount=1):
         self._assets_amount += amount
+
+    def is_children(self, other: 'TreeNode'):
+        pattern = r'^{0}:[0-9]+$'.format(other.key)
+        return bool(re.match(pattern, self.key))
+    
+    def is_all_children(self, other: 'TreeNode'):
+        pattern = r'^{0}:'.format(other.key)
+        return bool(re.match(pattern, self.key))
     
     def can_be_overridden(self, other: 'TreeNode'):
         """
@@ -67,8 +78,6 @@ class TreeNode:
 
 
 class Tree:
-
-    separator = ':'
 
     def __init__(self, nodes: Optional[list[TreeNode]] = None, org_id=None):
         # {node_key: TreeNode}
@@ -179,6 +188,31 @@ class Tree:
     @property
     def _owner_nodes(self):
         return [node for node in self._nodes.values() if node.type == TreeNode.Type.OWNER]
+
+    def get_node_all_assets(self, node: TreeNode):
+        """ 获取节点下的所有资产 """
+        nodes = self.get_node_all_children(node)
+        assets = set()
+        for n in nodes:
+            assets.update(n.assets)
+        return assets
+    
+    def get_node_all_children(self, node: TreeNode):
+        """ 获取节点的所有子孙节点 """
+        children = [
+            n for n in self._nodes.values() if n.is_all_children(node)
+        ]
+        return children
+    
+    def get_node_children(self, node: TreeNode):
+        """ 获取节点的直接子节点 """
+        children = [
+            n for n in self._nodes.values() if n.is_children(node)
+        ]
+        return children
+
+    def get_node(self, key) -> Optional[TreeNode]:
+        return self._nodes.get(key)
     
     def add_node(self, node: TreeNode):
         _node = self._nodes.get(node.key)
@@ -231,6 +265,7 @@ class UserPermTreeEngine(object):
         self._user_id = str(user.id)
         self._org_id = org_id or current_org.id
 
+    @lazyproperty
     def tree(self):
         da_tree = self._generate_da_tree()
         dn_tree = self._generate_dn_tree()
@@ -294,3 +329,24 @@ class UserPermTreeEngine(object):
             char_id=F('assetpermission_id')).values_list('char_id', flat=True)
         perm_ids = set(user_perm_ids).union(set(group_perm_ids))
         return perm_ids
+
+    def get_node_children(self, node_key, with_assets=False):
+        "Luna 页面会调用此方法"
+        tree_node = self.tree.get_node(node_key)
+        if not tree_node:
+            return None
+        children = self.tree.get_node_children(tree_node)
+        data = {"children": children}
+        if with_assets:
+            data.update({"assets": tree_node.assets})
+        return data
+
+    def get_node_all_assets(self, node_key):
+        " 用户详情页面会调用此方法 "
+        node = self.tree.get_node(node_key)
+        if not node:
+            return None
+        assets = self.tree.get_node_all_assets(node)
+        return {
+            "assets": assets
+        }
