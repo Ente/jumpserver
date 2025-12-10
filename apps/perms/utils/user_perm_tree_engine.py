@@ -1,4 +1,4 @@
-import re
+import re, time
 from typing import Optional
 from collections import defaultdict
 
@@ -7,8 +7,33 @@ from django.db.models import F
 from users.models import User
 from assets.models import Asset, Node
 from perms.models import AssetPermission
-from common.utils import lazyproperty
+from common.utils import lazyproperty, timeit
 from orgs.utils import current_org
+
+from django.core.cache import cache
+from functools import wraps
+
+def cache_tree(ttl=30):
+    """权限树缓存装饰器"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(self, *args, **kwargs):
+            # 构建缓存 key
+            cache_key = f"perm_tree:{self._org_id}:{self._user_id}"
+            
+            # 尝试从缓存获取
+            result = cache.get(cache_key)
+            if result is not None:
+                return result
+            
+            # 执行原方法
+            result = func(self, *args, **kwargs)
+            
+            # 缓存结果
+            cache.set(cache_key, result, ttl)
+            return result
+        return wrapper
+    return decorator
 
 
 class TreeNode:
@@ -122,8 +147,10 @@ class Tree:
             sorted(self._nodes.items(), key=lambda item: [int(i) for i in item[0].split(':')])
         )
     
+    @timeit
     def _init_owner_nodes_children(self):
         """ 初始化 Owner-Node 的所有子孙节点以及其下的直接资产 """
+        t1 = time.time()
         owner_nodes = self._owner_nodes
         if not owner_nodes:
             return
@@ -132,8 +159,12 @@ class Tree:
         node_id_key_mapper = dict(node_id_key_sets)
 
         node_ids = node_id_key_mapper.keys()
+        t2 = time.time()
         nid_aid_sets = Node.assets.through.objects.filter(node_id__in=node_ids).annotate(
             char_nid=F('node_id'), char_aid=F('asset_id')).values_list('char_nid', 'char_aid')
+        nid_aid_sets = list(nid_aid_sets)
+        t3 = time.time()
+        print('Fetch node-assets mapping time: {:.1f}ms'.format((t3 - t2) * 1000))
         
         for nid, aid in nid_aid_sets:
             key = node_id_key_mapper.get(nid)
@@ -264,8 +295,9 @@ class UserPermTreeEngine(object):
         self.user = user
         self._user_id = str(user.id)
         self._org_id = org_id or current_org.id
+        self._tree = self.tree()
 
-    @lazyproperty
+    @cache_tree(ttl=5)
     def tree(self):
         da_tree = self._generate_da_tree()
         dn_tree = self._generate_dn_tree()
