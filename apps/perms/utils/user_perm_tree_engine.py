@@ -2,9 +2,8 @@ from django.db.models import F
 from typing import Optional
 from collections import defaultdict
 
-from users.models import UserGroup, User
+from users.models import User
 from assets.models import Asset, Node
-from assets.utils.node import NodeAssetsUtil
 from perms.models import AssetPermission
 
 from common.utils import lazyproperty
@@ -21,24 +20,23 @@ class TreeNode:
     def __init__(self, key, tp, assets=None):
         self.key = key
         self.type = tp
+        # 节点下的直接资产集合，不包含子孙节点的资产
         self._assets = set() if assets is None else set(assets)
         self._assets_amount = 0
     
-    
     def add_assets(self, asset_ids):
         self._assets.update(asset_ids)
+
+    @property
+    def assets(self):
+        return self._assets
     
     @property
     def assets_amount(self):
         return self._assets_amount
 
-    @assets_amount.setter
-    def assets_amount(self, amount):
-        self._assets_amount = amount
-
-    @property
-    def assets(self):
-        return self._assets
+    def assets_amount_increment(self, amount=1):
+        self._assets_amount += amount
     
     def can_be_overridden(self, other: 'TreeNode'):
         """
@@ -73,6 +71,7 @@ class Tree:
     separator = ':'
 
     def __init__(self, nodes: Optional[list[TreeNode]] = None, org_id=None):
+        # {node_key: TreeNode}
         self._nodes = defaultdict(TreeNode)
         self._org_id = org_id
         self.init(nodes)
@@ -83,7 +82,6 @@ class Tree:
         for node in nodes:
             self.add_node(node)
         self._reverse_generated()
-        self._finalize()
     
     def _reverse_generated(self):
         """ 逆向生成树 """
@@ -100,14 +98,14 @@ class Tree:
             merged_tree.add_node(node)
         for node in other._nodes.values():
             merged_tree.add_node(node)
-        merged_tree._prune()
         merged_tree._finalize()
         return merged_tree
     
     def _finalize(self):
-        self._sorted()
-        self._init_owner_nodes_assets()
+        self._prune()
+        self._init_owner_nodes_children()
         self._compute_assets_amount()
+        self._sorted()
     
     def _sorted(self):
         self._nodes = defaultdict(
@@ -115,26 +113,64 @@ class Tree:
             sorted(self._nodes.items(), key=lambda item: [int(i) for i in item[0].split(':')])
         )
     
-    def _init_owner_nodes_assets(self):
-        mapper = Node.get_node_all_asset_ids_mapping(org_id=self._org_id)
-        for node in self._owner_nodes.values():
-            asset_ids = mapper.get(node.key, set())
-            node.add_assets(asset_ids)
+    def _init_owner_nodes_children(self):
+        """ 初始化 Owner-Node 的所有子孙节点以及其下的直接资产 """
+        owner_nodes = self._owner_nodes
+        if not owner_nodes:
+            return
+        nodes = Node.get_nodes_all_children(owner_nodes, with_self=True)
+        node_id_key_sets = nodes.annotate(char_id=F('id')).values_list('char_id', 'key')
+        node_id_key_mapper = dict(node_id_key_sets)
+
+        node_ids = node_id_key_mapper.keys()
+        nid_aid_sets = Node.assets.through.objects.filter(node_id__in=node_ids).annotate(
+            char_nid=F('node_id'), char_aid=F('asset_id')).values_list('char_nid', 'char_aid')
+        
+        for nid, aid in nid_aid_sets:
+            key = node_id_key_mapper.get(nid)
+            if not key:
+                continue
+            tree_node = self._nodes.get(key)
+            if tree_node:
+                tree_node.add_assets({aid})
+            else:
+                tree_node = self.wrap_as_tree_node(node_key=key, tp=TreeNode.Type.OWNER, assets={aid})
+                self.add_node(tree_node)
     
     def _compute_assets_amount(self):
-        mapper = {node.key: node.assets for node in self._nodes.values()}
-
-        util = NodeAssetsUtil(nodes=self._nodes.values(), nodekey_assetsid_mapper=mapper)
-        util.generate()
+        """
+        生成数据结构:
+        {
+            "asset_id": set("node_key1", "node_key2" ...), # 资产所在的直接节点
+        }
+        迭代，对每个资产所在的节点的所有祖先节点取并集+去重, +1
+        """
+        aid_node_keys_mapper = defaultdict(set)
         for node in self._nodes.values():
-            node.assets_amount = util.get_assets_amount(node.key)
+            for aid in node.assets:
+                aid_node_keys_mapper[aid].add(node.key)
         
+        for aid, node_keys in aid_node_keys_mapper.items():
+            ancestor_keys = set(self.get_ancestor_keys(node_keys)) # 必须去重
+            for ancestor_key in ancestor_keys:
+                tree_node = self._nodes.get(ancestor_key)
+                if not tree_node:
+                    continue
+                tree_node.assets_amount_increment()
+        
+    def get_ancestor_keys(self, keys, with_self=True):
+        ancestor_keys = set()
+        for k in keys:
+            _ancestor_keys = Node.get_node_ancestor_keys(k, with_self=with_self)
+            ancestor_keys.update(_ancestor_keys)
+        return ancestor_keys
+
     def _prune(self):
         self._prune_owner_nodes_branch()
     
     def _prune_owner_nodes_branch(self):
         # 修剪所有 owner nodes 节点的分枝（保留每条 owner 节点分枝的最上一层，删除其所有子孙节点）
-        owner_node_keys = list(self._owner_nodes.keys())
+        owner_node_keys = [n.key for n in self._owner_nodes]
         for node in list(self._nodes.values()):
             ancestor_keys = Node.get_node_ancestor_keys(node.key)
             if set(ancestor_keys) & set(owner_node_keys):
@@ -142,9 +178,7 @@ class Tree:
     
     @property
     def _owner_nodes(self):
-        return {
-            key: node for key, node in self._nodes.items() if node.type == TreeNode.Type.OWNER
-        }
+        return [node for node in self._nodes.values() if node.type == TreeNode.Type.OWNER]
     
     def add_node(self, node: TreeNode):
         _node = self._nodes.get(node.key)
@@ -170,8 +204,8 @@ class Tree:
     def wrap_as_tree_nodes(cls, node_keys, tp):
         return [cls.wrap_as_tree_node(nk, tp) for nk in node_keys]
 
-
     def print_nodes(self):
+        print('--- Tree Nodes ---')
         for n in self._nodes.values():
             print(f'{n.key}({n.assets_amount}) - {n.type}')
 
@@ -199,11 +233,7 @@ class UserPermTreeEngine(object):
 
     def tree(self):
         da_tree = self._generate_da_tree()
-        print("DA Tree Nodes:")
-        da_tree.print_nodes()
         dn_tree = self._generate_dn_tree()
-        print("DN Tree Nodes:")
-        dn_tree.print_nodes()
         tree = self._merge_trees(da_tree, dn_tree)
         return tree
 
@@ -220,18 +250,19 @@ class UserPermTreeEngine(object):
         direct_asset_ids = AssetPermission.assets.through.objects \
             .filter(assetpermission_id__in=self._perm_ids) \
             .annotate(char_id=F('asset_id')).values_list('char_id', flat=True)
-        node_asset_ids = Asset.nodes.through.objects.filter(asset_id__in=direct_asset_ids).annotate(
-            char_nid=F('node_id'), char_aid=F('asset_id')).values_list('char_nid', 'char_aid')
-        
-        node_ids = dict(node_asset_ids).keys()
-        id_key_mapper= dict(Node.objects.filter(id__in=node_ids).annotate(char_id=F('id')).values_list('id', 'key'))
+        nid_aid_set = Asset.nodes.through.objects.filter(asset_id__in=direct_asset_ids) \
+            .annotate(char_nid=F('node_id'), char_aid=F('asset_id')).values_list('char_nid', 'char_aid')
+        nid_aid_mapper = dict(nid_aid_set)
+
+        node_ids = list(nid_aid_mapper.keys())
+        node_id_key_set = Node.objects.filter(id__in=node_ids).annotate(char_id=F('id')).values_list('id', 'key')
+        node_id_key_mapper = dict(node_id_key_set)
 
         mapper = defaultdict(set)
-        for nid, aid in node_asset_ids:
-            key = id_key_mapper.get(nid)
-            if not key:
-                continue
-            mapper[key].add(aid)
+        for nid, aid in nid_aid_set:
+            key = node_id_key_mapper.get(nid)
+            if key:
+                mapper[key].add(aid)
         return mapper
 
     def _generate_dn_tree(self):
