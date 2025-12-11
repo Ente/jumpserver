@@ -9,7 +9,6 @@ from assets.models import Asset, Node
 from perms.models import AssetPermission
 from common.utils import lazyproperty, timeit
 from orgs.utils import current_org
-
 from django.core.cache import cache
 from functools import wraps
 
@@ -162,9 +161,12 @@ class Tree:
         t2 = time.time()
         nid_aid_sets = Node.assets.through.objects.filter(node_id__in=node_ids).annotate(
             char_nid=F('node_id'), char_aid=F('asset_id')).values_list('char_nid', 'char_aid')
+        
         nid_aid_sets = list(nid_aid_sets)
         t3 = time.time()
-        print('Fetch node-assets mapping time: {:.1f}ms'.format((t3 - t2) * 1000))
+        print('Fetch node-assets sets time by node_id__in: {:.1f}ms'.format((t3 - t2) * 1000))
+        t4 = time.time()
+        print('Fetch all node-assets sets time: {:.1f}ms'.format((t4 - t3) * 1000))
         
         for nid, aid in nid_aid_sets:
             key = node_id_key_mapper.get(nid)
@@ -382,3 +384,91 @@ class UserPermTreeEngine(object):
         return {
             "assets": assets
         }
+
+    from common.utils import timeit
+    @timeit
+    def query_3_result(guessed_asset_amount=50000, view_old=False):
+        from django.db import connection, connections
+        from django.conf import settings
+        from django.db.models import OuterRef, Subquery, Count
+        import time
+
+        settings.DEBUG = True
+        connections.close_all()
+
+        with connection.cursor() as cursor:
+            # 1 查询节点资产数量
+            # cursor.execute(sql1)
+            # node_key_asset_amount_tuple = cursor.fetchall()
+
+            t1 = time.time()
+            # sql1 = """
+            # SELECT node_id, COUNT(*) AS assets_count
+            # FROM assets_asset_nodes
+            # GROUP BY node_id
+            # """
+            # cursor.execute(sql1)
+            # node_id_asset_amount_rows = cursor.fetchall()
+
+            count_sub = Node.assets.through.objects.filter(
+                node_id=OuterRef("id")
+            ).values("node_id").annotate(c=Count("id")).values("c")
+
+            node_id_asset_amount_rows = Node.objects.annotate(
+                assets_count=Subquery(count_sub)
+            ).values("id", "assets_count")
+            node_id_asset_amount_rows = list(node_id_asset_amount_rows)
+
+            t2 = time.time()
+            # 2 查询属于多个节点的资产ID
+            # sql2 = """
+            # SELECT asset_id FROM assets_asset_nodes
+            # GROUP BY asset_id HAVING COUNT(*) > 1
+            # """
+            # cursor.execute(sql2)
+            # rows = cursor.fetchall()
+            # asset_ids = [row[0] for row in rows]
+
+            count_sub = Asset.nodes.through.objects.filter(
+                asset_id=OuterRef("id")
+            ).values("asset_id").annotate(c=Count("id")).values("c")
+
+            asset_id_node_amount_row = Asset.objects.annotate(
+                nodes_count=Subquery(count_sub)
+            ).values_list('id', 'nodes_count')
+            print(asset_id_node_amount_row[0])
+
+            asset_ids = [str(row[0]) for row in asset_id_node_amount_row if row[1] and row[1] > 1]
+            print('Assets belong to multiple nodes:', len(asset_ids))
+
+            t3 = time.time()
+            # 3 查询资产ID和节点ID的对应关系 (只查 2 的资产)
+            # 假设 asset_ids 不多，只查前 guessed_asset_amount 个
+            guessed_asset_ids = asset_ids[:guessed_asset_amount]
+            # print('Guessed asset ids count:', len(guessed_asset_ids))
+            # sql3 = """
+            # SELECT asset_id, node_id FROM assets_asset_nodes
+            # WHERE asset_id IN ({})
+            # """.format(','.join(['%s'] * len(guessed_asset_ids)))
+            # cursor.execute(sql3, guessed_asset_ids)
+            # aid_nid_set = cursor.fetchall()
+
+            aid_nid_set = Node.assets.through.objects.filter(asset_id__in=guessed_asset_ids).values_list('asset_id', 'node_id')
+            aid_nid_set = list(aid_nid_set)
+            t4 = time.time()
+            # aid_nid_set 获取每个 aid 的 parent_ids, 获取两两 parent 的祖先节点的交集 -1
+        
+        print('Query times: sql1 {:.2f}s, sql2 {:.2f}s, sql3 {:.2f}s'.format(t2 - t1, t3 - t2, t4 - t3), 
+              len(node_id_asset_amount_rows), len(asset_ids), len(aid_nid_set))
+            
+
+        print('New ORM query time: {:.2f}s, total rows: {}'.format(t4 - t1, len(aid_nid_set)))
+
+        # old 
+
+        if view_old:
+            t1 = time.time()
+            old = list(Node.assets.through.objects.all())
+            t2 = time.time()
+            print('Old ORM query time: {:.2f}s, total rows: {}'.format(t2 - t1, len(old)))
+        return node_id_asset_amount_rows, asset_ids, aid_nid_set
