@@ -387,7 +387,7 @@ class UserPermTreeEngine(object):
 
     from common.utils import timeit
     @timeit
-    def query_3_result(guessed_asset_amount=50000, view_old=False):
+    def query_3_result(guessed_asset_amount=50000, view_old=False, sql2_raw=False, sql1_raw=False, sql3_raw=False):
         from django.db import connection, connections
         from django.conf import settings
         from django.db.models import OuterRef, Subquery, Count
@@ -402,58 +402,61 @@ class UserPermTreeEngine(object):
             # node_key_asset_amount_tuple = cursor.fetchall()
 
             t1 = time.time()
-            # sql1 = """
-            # SELECT node_id, COUNT(*) AS assets_count
-            # FROM assets_asset_nodes
-            # GROUP BY node_id
-            # """
-            # cursor.execute(sql1)
-            # node_id_asset_amount_rows = cursor.fetchall()
+            if sql1_raw:
+                # 不能用 raw 因为node下没有资产在表中不存在，node 获取不完整
+                sql1 = """
+                SELECT node_id, COUNT(*) AS assets_count
+                FROM assets_asset_nodes
+                GROUP BY node_id
+                """
+                cursor.execute(sql1)
+                node_id_asset_amount_rows = cursor.fetchall()
+            else:
+                count_sub = Node.assets.through.objects.filter(
+                    node_id=OuterRef("id")
+                ).values("node_id").annotate(c=Count("id")).values("c")
 
-            count_sub = Node.assets.through.objects.filter(
-                node_id=OuterRef("id")
-            ).values("node_id").annotate(c=Count("id")).values("c")
-
-            node_id_asset_amount_rows = Node.objects.annotate(
-                assets_count=Subquery(count_sub)
-            ).values("id", "assets_count")
+                node_id_asset_amount_rows = Node.objects.annotate(
+                    assets_count=Subquery(count_sub)
+                ).values("id", "assets_count")
             node_id_asset_amount_rows = list(node_id_asset_amount_rows)
 
             t2 = time.time()
             # 2 查询属于多个节点的资产ID
-            # sql2 = """
-            # SELECT asset_id FROM assets_asset_nodes
-            # GROUP BY asset_id HAVING COUNT(*) > 1
-            # """
-            # cursor.execute(sql2)
-            # rows = cursor.fetchall()
-            # asset_ids = [row[0] for row in rows]
+            if sql2_raw:
+                sql2 = """
+                SELECT asset_id FROM assets_asset_nodes
+                GROUP BY asset_id HAVING COUNT(*) > 1
+                """
+                cursor.execute(sql2)
+                rows = cursor.fetchall()
+                asset_ids = [row[0] for row in rows]
+            else:
+                count_sub = Asset.nodes.through.objects.filter(
+                    asset_id=OuterRef("id")
+                ).values("asset_id").annotate(c=Count("id")).values("c")
 
-            count_sub = Asset.nodes.through.objects.filter(
-                asset_id=OuterRef("id")
-            ).values("asset_id").annotate(c=Count("id")).values("c")
-
-            asset_id_node_amount_row = Asset.objects.annotate(
-                nodes_count=Subquery(count_sub)
-            ).values_list('id', 'nodes_count')
-            print(asset_id_node_amount_row[0])
-
-            asset_ids = [str(row[0]) for row in asset_id_node_amount_row if row[1] and row[1] > 1]
+                asset_id_node_amount_row = Asset.objects.annotate(
+                    nodes_count=Subquery(count_sub)
+                ).values_list('id', 'nodes_count')
+                print(asset_id_node_amount_row[0])
+                asset_ids = [str(row[0]) for row in asset_id_node_amount_row if row[1] and row[1] > 1]
             print('Assets belong to multiple nodes:', len(asset_ids))
 
             t3 = time.time()
             # 3 查询资产ID和节点ID的对应关系 (只查 2 的资产)
             # 假设 asset_ids 不多，只查前 guessed_asset_amount 个
             guessed_asset_ids = asset_ids[:guessed_asset_amount]
-            # print('Guessed asset ids count:', len(guessed_asset_ids))
-            # sql3 = """
-            # SELECT asset_id, node_id FROM assets_asset_nodes
-            # WHERE asset_id IN ({})
-            # """.format(','.join(['%s'] * len(guessed_asset_ids)))
-            # cursor.execute(sql3, guessed_asset_ids)
-            # aid_nid_set = cursor.fetchall()
-
-            aid_nid_set = Node.assets.through.objects.filter(asset_id__in=guessed_asset_ids).values_list('asset_id', 'node_id')
+            if sql3_raw:
+                print('Guessed asset ids count:', len(guessed_asset_ids))
+                sql3 = """
+                SELECT asset_id, node_id FROM assets_asset_nodes
+                WHERE asset_id IN ({})
+                """.format(','.join(['%s'] * len(guessed_asset_ids)))
+                cursor.execute(sql3, guessed_asset_ids)
+                aid_nid_set = cursor.fetchall()
+            else:
+                aid_nid_set = Node.assets.through.objects.filter(asset_id__in=guessed_asset_ids).values_list('asset_id', 'node_id')
             aid_nid_set = list(aid_nid_set)
             t4 = time.time()
             # aid_nid_set 获取每个 aid 的 parent_ids, 获取两两 parent 的祖先节点的交集 -1
